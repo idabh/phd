@@ -1,0 +1,115 @@
+---
+title: "exploratory_media_studies_jan2026"
+format: html
+editor: visual
+editor_options: 
+  chunk_output_type: console
+---
+
+## Libraries
+
+```{r}
+library(tidyverse) ; library(skimr)
+
+```
+
+## Load & clean
+
+```{r}
+# data
+df <- read.csv("ms_data/survey/dataset.csv",
+               sep = ",",
+               header = TRUE,
+               stringsAsFactors = FALSE)
+
+# labels
+labels <- read_csv("ms_data/survey/labels.csv",
+                   col_names = c("var", "code", "label"),
+                   show_col_types = FALSE)
+
+# also load other surveyxact files just in case? :
+
+structure <- read_csv("ms_data/survey/structure.csv")
+variables <- read_csv("ms_data/survey/variables.csv")
+#complete <- read_csv("ms_data/survey/complete.csv") # doesn't work?
+```
+
+Fix data labels/names:
+
+```{r}
+
+# columns that are factors (and where values need proper labels)
+coded_vars <- structure %>%
+  filter(questionType == "Closed") %>%
+  pull(variableName) %>%
+  unique()
+
+# label the values based on 'labels' (e.g. "Female" instead of "1")
+df <- df %>%
+  mutate(across(
+    any_of(coded_vars),
+    ~{
+      map <- labels %>% filter(var == cur_column()) %>% arrange(code)
+      factor(as.integer(.x), levels = map$code, labels = map$label)
+    }
+  ))
+
+
+# fix column names
+# variableName -> questionName
+name_map <- setNames(structure$questionName, structure$variableName)
+# rename df columns
+names(df) <- name_map[names(df)]
+
+
+# fix duplicate column names (dumb surveyxact 'statoverall' variables)
+names(df)[duplicated(names(df))] # check
+names(df) <- make.unique(names(df)) # fix
+
+```
+
+Remove & rename:
+
+```{r}
+# filter df to only include students that provided basic consent
+summary(df$consent_basic)
+df <- df %>% filter(consent_basic == "Ja",)
+summary(df$consent_basic) # check
+
+# remove test entry row
+df <- df %>% filter(au_id != "test_testesen",)
+
+# remove columns that are empty/extra
+df <- df %>%
+  select(-any_of(c("s_105", "email",
+                   "statoverall", "statoverall.1", "statoverall.2",
+                   "statoverall.3", "statoverall.4")))
+
+# rename columns that don't have proper names
+df <- df %>%
+  rename(
+    group = s_65,
+    abstract_draft = s_67,
+    abstract_revised = s_69,
+    AI_useful = s_98
+  )
+
+
+# (remove au id column? - once matched with chatlog data...)
+```
+
+SAVE the pre-processed data frame:
+
+```{r}
+# Save the pre-processed df as csv (could also save as .rdf)
+write.csv(df, "ms_data/survey/df_preprocessed.csv", row.names = FALSE)
+```
+
+## Explore data structure...
+
+```{r}
+skimr::skim(df)
+
+
+
+```

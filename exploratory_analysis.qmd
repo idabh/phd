@@ -9,35 +9,40 @@ editor_options:
 ## Libraries
 
 ```{r}
-library(tidyverse) ; library(skimr)
+# install.packages("pacman")
+# p_load both installs (if not installed) and loads packages
+pacman::p_load(tidyverse, skimr, ggrain)
 
 ```
 
-## Load & clean
+# SURVEY DATA
+
+## Preprocessing
+
+Exporting data from SurveyXact results in 5 different files: complete, dataset, labels, structure, variables.
 
 ```{r}
 # data
 df <- read.csv("ms_data/survey/dataset.csv",
                sep = ",",
                header = TRUE,
-               stringsAsFactors = FALSE)
+               stringsAsFactors = FALSE,
+               fileEncoding = "Windows-1252") # important to retain æøå
 
 # labels
 labels <- read_csv("ms_data/survey/labels.csv",
                    col_names = c("var", "code", "label"),
                    show_col_types = FALSE)
 
-# also load other surveyxact files just in case? :
-
-structure <- read_csv("ms_data/survey/structure.csv")
-variables <- read_csv("ms_data/survey/variables.csv")
-#complete <- read_csv("ms_data/survey/complete.csv") # doesn't work?
+# structure & variables
+structure <- read.csv("ms_data/survey/structure.csv", fileEncoding = "Windows-1252")
+variables <- read.csv("ms_data/survey/variables.csv", fileEncoding = "Windows-1252")
+complete <- read.csv("ms_data/survey/complete.csv", fileEncoding = "Windows-1252") # currently not using...
 ```
 
-Fix data labels/names:
+Fix labels for data values and column names:
 
 ```{r}
-
 # columns that are factors (and where values need proper labels)
 coded_vars <- structure %>%
   filter(questionType == "Closed") %>%
@@ -54,21 +59,18 @@ df <- df %>%
     }
   ))
 
-
 # fix column names
 # variableName -> questionName
 name_map <- setNames(structure$questionName, structure$variableName)
 # rename df columns
 names(df) <- name_map[names(df)]
 
-
 # fix duplicate column names (dumb surveyxact 'statoverall' variables)
 names(df)[duplicated(names(df))] # check
 names(df) <- make.unique(names(df)) # fix
-
 ```
 
-Remove & rename:
+REMOVE & RENAME columns:
 
 ```{r}
 # filter df to only include students that provided basic consent
@@ -76,7 +78,7 @@ summary(df$consent_basic)
 df <- df %>% filter(consent_basic == "Ja",)
 summary(df$consent_basic) # check
 
-# remove test entry row
+# REMOVE test entry row
 df <- df %>% filter(au_id != "test_testesen",)
 
 # remove columns that are empty/extra
@@ -85,17 +87,245 @@ df <- df %>%
                    "statoverall", "statoverall.1", "statoverall.2",
                    "statoverall.3", "statoverall.4")))
 
-# rename columns that don't have proper names
+# RENAME columns that don't have proper names
 df <- df %>%
   rename(
-    group = s_65,
+    condition = s_65,
     abstract_draft = s_67,
     abstract_revised = s_69,
     AI_useful = s_98
   )
 
+# rename condition values
+df <- df %>%
+  mutate(condition = fct_recode(condition,
+                                "Metacognitive (A)" = "A",
+                                "Instructional (B)" = "B"))
+
+
 
 # (remove au id column? - once matched with chatlog data...)
+```
+
+ADD columns based on calculated aggregate variables:
+
+#### FEEDBACK PERCEPTION SCORE
+
+"FA, US and AC constitute the joined second order component ‘Perceived Adequacy of Feedback’ (PAF), which in turn positively predicts willingness to improve (WI) and affect (AF)."
+
+![](images/clipboard-3576545932.png)
+
+Strijbos, J. W., Pat-El, R. J., & Narciss, S. (2010, May). Validation of a (peer) feedback perceptions questionnaire. In *Proceedings of the International Conference on Networked Learning* (Vol. 7, pp. 378-386).
+
+Reverse coding explained:
+
+![](images/clipboard-1936206519.png){width="306"}
+
+```{r}
+# calculate AI feedback perception score
+names(df)[startsWith(names(df), "feedback_perception")]
+
+# 18-item scale. Naming from:
+# https://www-sciencedirect-com.ez.statsbiblioteket.dk/science/article/pii/S0191491X21000067#sec0135
+
+# the 18 names (just renaming for clarity):
+fp_names <- c(
+  "FA1_satisfied", "FA2_fair", "FA3_justified", "US1_useful", "US2_helpful", "US3_support", "AC1_accept",
+  "AC2_dispute", "AC3_reject", "WI1_willing_improve", "WI2_willing_invest_effort",
+  "WI3_willing_work_on_similar", "AF2_felt_satisfied", "AF4_felt_confident",
+  "AF6_felt_successful", "AF1_felt_offended", "AF3_felt_angry", "AF5_felt_frustrated"
+)
+# (thought: the two 'satisfied' items are quite similar...?)
+
+# rename column names:
+df <- df %>%
+  rename_with(
+    .cols = starts_with("feedback_perception"),
+    .fn = ~ paste0(
+      "fp",
+      str_extract(.x, "\\d+"),                 # grabs the number from feedback_perception##
+      "_",
+      fp_names[as.integer(str_extract(.x, "\\d+"))]  # maps number -> name
+    )
+  )
+
+#check
+names(df)[startsWith(names(df), "fp")]
+
+# recode from factors to numeric (1-10)
+df <- df %>%
+  mutate(
+    across(
+      starts_with("fp"),
+      ~ as.numeric(str_extract(as.character(.x), "^\\d+"))
+    )
+  )
+
+str(df$fp1_FA1_satisfied) # check
+
+
+# SCORE the questionnaire (including reverse items)
+scale_min <- 1
+scale_max <- 10
+
+rev_score <- function(x, minv = scale_min, maxv = scale_max) {
+  ifelse(is.na(x), NA, (minv + maxv) - x)
+}
+
+df <- df %>%
+  mutate(
+    # reverse-code the negative items (overwrite)
+    fp8_AC2_dispute          = rev_score(fp8_AC2_dispute),
+    fp9_AC3_reject           = rev_score(fp9_AC3_reject),
+    fp16_AF1_felt_offended   = rev_score(fp16_AF1_felt_offended),
+    fp17_AF3_felt_angry      = rev_score(fp17_AF3_felt_angry),
+    fp18_AF5_felt_frustrated = rev_score(fp18_AF5_felt_frustrated),
+
+    # subscale means (restricted to fp items only)
+    fp_fairness    = rowMeans(across(starts_with("fp") & contains("_FA")), na.rm = TRUE),
+    fp_usefulness  = rowMeans(across(starts_with("fp") & contains("_US")), na.rm = TRUE),
+    fp_acceptance  = rowMeans(across(starts_with("fp") & contains("_AC")), na.rm = TRUE),
+    fp_willingness = rowMeans(across(starts_with("fp") & contains("_WI")), na.rm = TRUE),
+    fp_affect      = rowMeans(across(starts_with("fp") & contains("_AF")), na.rm = TRUE),
+
+    # PAF (the 9-item combined score: FA + US + AC)
+    fp_paf = rowMeans(
+      across(starts_with("fp") & (contains("_FA") | contains("_US") | contains("_AC"))),
+      na.rm = TRUE
+    )
+  )
+
+
+fp_summary <- df %>%
+  summarise(
+    across(
+      c(fp_fairness, fp_usefulness, fp_acceptance, fp_willingness, fp_affect, fp_paf),
+      list(
+        #n = ~ sum(!is.na(.)),
+        mean = ~ mean(., na.rm = TRUE),
+        sd = ~ sd(., na.rm = TRUE),
+        min = ~ min(., na.rm = TRUE),
+        max = ~ max(., na.rm = TRUE)
+      )
+    )
+  )
+
+# look at participant-level scores:
+df %>% select(fp_fairness, fp_usefulness, fp_acceptance, fp_willingness, fp_affect, fp_paf)
+
+```
+
+PLOTTING FEEDBACK PERCEPTION SCORES PER CONDITION:
+
+```{r}
+# 1) Long format (one row per person x score)
+fp_long <- df %>%
+  select(condition, fp_fairness, fp_usefulness, fp_acceptance,
+         fp_willingness, fp_affect, fp_paf) %>%
+  pivot_longer(
+    cols = starts_with("fp_"),
+    names_to = "scale",
+    values_to = "score"
+  ) %>%
+  mutate(
+    condition = factor(condition),
+    scale = factor(
+      scale,
+      levels = c("fp_paf", "fp_fairness", "fp_usefulness", "fp_acceptance",
+                 "fp_willingness", "fp_affect"),
+      labels = c("Perceived Adequacy of Feedback (FA + US + AC)", "Fairness (FA)", "Usefulness (US)", "Acceptance (AC)",
+                 "Willingness to improve", "(Positive) Affect")
+    )
+  )
+
+# 2) Raincloud plot per condition, faceted by scale
+plot_FPQ <- ggplot(fp_long, aes(x = condition, y = score, fill = condition, color = condition)) +
+  geom_rain(
+    alpha = 0.6,
+    rain.side = "l",  # half-violin on the LEFT
+
+    # make boxplot clearly visible + remove outlier points (since you show raw points)
+    boxplot.args = list(color = "black", outlier.shape = NA),
+
+    # nudge boxplot to the RIGHT so it's not covered by the violin
+    boxplot.args.pos = list(
+      width = 0.12,
+      position = position_nudge(x = 0.15)
+    ),
+
+    point.args = list(size = 1.6, alpha = 0.6)
+  ) +
+  facet_wrap(
+    ~ scale, ncol = 3,
+    labeller = as_labeller(c(
+      "Perceived Adequacy of Feedback (FA + US + AC)" = "Perceived Adequacy of Feedback (FA+US+AC)\n(k = 9 items)",
+      "Fairness (FA)" = "Fairness (FA)\n(k = 3 items)",
+      "Usefulness (US)" = "Usefulness (US)\n(k = 3 items)",
+      "Acceptance (AC)" = "Acceptance (AC)\n(k = 3 items)",
+      "Willingness to improve" = "Willingness to improve\n(k = 3 items)",
+      "(Positive) Affect" = "(Positive) Affect\n(k = 6 items)"
+    ))
+  ) +
+  scale_y_continuous(breaks = 1:10, limits = c(1, 10)) +
+  labs(
+    title = "AI Feedback Perception (FPQ) by condition",
+    x = NULL,
+    y = "Score (1–10)"
+  ) +
+  theme_classic() +
+  theme(
+    plot.title = element_text(face = "bold"),
+    legend.position = "none",
+    panel.grid.major.y = element_line(color = "grey85")
+  )
+
+plot_FPQ
+
+```
+
+\^\^TO-DO: reorder plots so it's main focus on:
+
+![](images/clipboard-474062586.png)
+
+#### SELF-ASSESSMENT OF ABSTRACT
+
+`{r} # self-assessment change (and as integers instead of words) df <- df %>%   mutate(     self_ass_pre  = as.integer(ordered(self_ass1)),     self_ass_post = as.integer(ordered(self_ass2)),     self_ass_delta = self_ass_post - self_ass_pre   ) # self-ass change direction df <- df %>%   mutate(     self_ass_direction = case_when(       self_ass_delta > 0 ~ "Up",       self_ass_delta < 0 ~ "Down",       TRUE ~ "No change"     ) %>% factor(levels = c("Down","No change","Up"))   )     # calculate feedback literacy score}`
+
+#### AI LITERACY SCORE
+
+```{r}
+
+```
+
+#### FEEDBACK LITERACY SCORE
+
+```{r}
+
+```
+
+#### ABSTRACT TEXTUAL METRICS
+
+-   Edit distance
+
+```{r}
+
+```
+
+OBS - TO-DO
+
+```{r}
+# merge df and per_thread! (maybe has to be manually based on abstract?!)
+
+# add more data from chatlogs to per_thread BEFORE merging per_thread with chatlogs (e.g. a column for each message? or a column with a list of the messages???)
+
+
+
+
+
+
+# HIKh93: first language label is currently '3' + age is NA
+
+
 ```
 
 SAVE the pre-processed data frame:
@@ -110,6 +340,420 @@ write.csv(df, "ms_data/survey/df_preprocessed.csv", row.names = FALSE)
 ```{r}
 skimr::skim(df)
 
+summary(df)
 
 
+```
+
+## Plots plots plots
+
+### Functions etc.
+
+```{r}
+plot_by_condition_numeric <- function(data, var) {
+  ggplot(data, aes(x = condition, y = .data[[var]])) +
+    geom_jitter(width = 0.15, height = 0, alpha = 0.5) +
+    stat_summary(fun = median, geom = "point", size = 3) +
+    stat_summary(fun.data = ~{
+      tibble(y = median(.x), ymin = quantile(.x, .25), ymax = quantile(.x, .75))
+    }, geom = "errorbar", width = 0.2) +
+    labs(x = NULL, y = var, title = paste(var, "by condition")) +
+    theme_minimal()
+}
+#plot_by_condition_numeric(df, "self_ass_delta")
+# plot_by_condition_numeric(df, "AI_useful")
+
+
+# raincloud version of this function:
+
+
+
+
+```
+
+### Self-assessment of abstract quality
+
+REMEMBER: Because self-ass is ordinal, self_ass_delta treats steps as equally spaced. Totally fine for exploratory plots (and often reported descriptively), but for your primary inference you’ll still likely want an ordinal repeated-measures model on the long data.
+
+Exploring:
+
+```{r}
+plot_by_condition_numeric(df, "self_ass_delta")
+```
+
+QUICK (AI) "DASHBOARD" OVERVIEW OF SELF-ASS 1 & 2 PER CONDITION:
+
+```{r}
+self_long <- df %>%
+  select(pseudo_code, condition, self_ass1, self_ass2) %>%
+  pivot_longer(
+    cols = c(self_ass1, self_ass2),
+    names_to = "timepoint",
+    values_to = "self_ass"
+  ) %>%
+  mutate(
+    timepoint = recode(timepoint, self_ass1 = "Pre", self_ass2 = "Post"),
+    timepoint = factor(timepoint, levels = c("Pre", "Post")),
+    self_ass = ordered(self_ass),
+    self_ass_num = as.integer(self_ass) # for plotting on a numeric axis
+  )
+
+self_change <- df %>%
+  select(pseudo_code, condition, self_ass1, self_ass2) %>%
+  mutate(
+    pre  = as.integer(ordered(self_ass1)),
+    post = as.integer(ordered(self_ass2)),
+    delta = post - pre,
+    direction = case_when(
+      delta > 0 ~ "Up",
+      delta < 0 ~ "Down",
+      TRUE ~ "No change"
+    )
+  ) %>%
+  mutate(direction = factor(direction, levels = c("Down","No change","Up")))
+
+
+# paired change (spaghetti)
+ggplot(self_long, aes(x = timepoint, y = self_ass_num, group = pseudo_code)) +
+  geom_line(alpha = 0.2) +
+  geom_point(alpha = 0.6) +
+  facet_wrap(~ condition) +
+  scale_x_discrete(drop = FALSE) +
+  labs(x = NULL, y = "Self-ass (ordinal level)") +
+  theme_minimal()
+
+
+# change score by condition
+ggplot(self_change, aes(x = condition, y = delta)) +
+  geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.6) +
+  geom_jitter(width = 0.15, height = 0.08, alpha = 0.5) +
+  stat_summary(fun = median, geom = "point", size = 3) +
+  stat_summary(fun.data = ~{
+    tibble(y = median(.x), ymin = quantile(.x, .25), ymax = quantile(.x, .75))
+  }, geom = "errorbar", width = 0.2) +
+  labs(x = NULL, y = "Δ (Post - Pre)") +
+  theme_minimal()
+
+
+# direction of change
+self_change %>%
+  count(condition, direction) %>%
+  group_by(condition) %>%
+  mutate(p = n / sum(n)) %>%
+  ggplot(aes(x = condition, y = p, fill = direction)) +
+  geom_col(position = "fill") +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(x = NULL, y = "Percent", title = "Direction of change by condition") +
+  theme_minimal()
+
+# transition heatmap (just to look at for exploratory fun...)
+self_change %>%
+  count(condition, pre, post) %>%
+  ggplot(aes(x = pre, y = post, fill = n)) +
+  geom_tile() +
+  facet_wrap(~ condition) +
+  labs(x = "Pre level", y = "Post level", title = "Transitions Pre → Post") +
+  theme_minimal()
+```
+
+MAIN Self-ass final plots of interest:
+
+```{r}
+# make it RAINCLOUD!
+
+
+
+```
+
+### AI feedback perception
+
+```{r}
+
+```
+
+### Found AI useful?
+
+```{r}
+
+```
+
+# CHATLOG DATA
+
+## Load & clean
+
+```{r}
+# LOAD data (in tsv format from Anton)
+chatlogs <- read_tsv("ms_data/chatlogs/pseudonomized_data.tsv")
+
+
+# INSPECT different value counts
+inspect_unique <- tibble(
+  column   = names(chatlogs),
+  n_unique = map_int(chatlogs, n_distinct),
+  uniques  = map(chatlogs, ~ {
+    u <- unique(.x)
+    if (length(u) <= 25) u else "OVER 25 UNIQUE VALUES"
+  })
+) %>%
+  arrange(desc(n_unique))
+
+
+# DELETING COLUMNS
+
+# delete consta
+# - delete columns that have the same value all the way down (just because it feels a bit cluttered to me:
+# TRUE if a column has only 1 unique value (ignoring NA)
+is_constant <- sapply(chatlogs, function(x) length(unique(na.omit(x))) <= 1)
+names(chatlogs)[is_constant] # names of constant columns
+chatlogs <- chatlogs[, !is_constant, drop = FALSE] # delete the constant columns (type, multimodalimage, attachments)
+
+# delete unique
+#Not sure what these 3 columns represent? (_rid, _self, _etag) But values are unique for each row (so I'll delete them to declutter):
+chatlogs <- chatlogs %>% select(-`_rid`, -`_self`, -`_etag`)
+
+
+# RENAME column names:
+chatlogs <- chatlogs %>%
+  rename(
+    time_epoch = `_ts`,
+    time_datetime = createdAt,
+    thread_id = threadId,
+    user_id = userId,
+    is_deleted = isDeleted
+  )
+
+# ADD COLUMNS
+# add column to df 'chatlogs' with the condition... steps:
+# so if column "name" ends in "_A" or "_B" ... (it only will for the student messages), then I need to check the corresponding thread id (which also includes the rows with AI messages), and then for each of those thread IDs, in a new column "condition", the value should be either "A" or "B"
+
+chatlogs <- chatlogs %>%
+  group_by(thread_id) %>%
+  mutate(
+    condition = case_when(
+      any(str_detect(name, "_A$")) ~ "Metacognitive (A)",
+      any(str_detect(name, "_B$")) ~ "Instructional (B)",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  ungroup()
+
+# CHANGE DATA TYPES:
+str(chatlogs) # check types
+
+# turn categorical columns into factors
+chatlogs <- chatlogs %>%
+  mutate(across(c("role", "condition", "is_deleted", "name", "user_id", "thread_id"), as.factor))
+```
+
+Describing the current data structure:
+
+-   **id:** unique message ID (each message has its own)
+
+-   **time_datetime:** Human-readable datetime format
+
+-   **is_deleted:** Whether the message was deleted?
+
+-   **content:** The message content
+
+-   **name:** the name of the student (or AI) that sent the message
+
+-   **role:** User (student) or Assistant (AI)
+
+-   **thread_id:** The unique identifier of that chat conversation (used both for student and AI messages)
+
+-   **user_id:** The unique identifier of that student/login (used both for student and AI) - but would stay identical even across multiple different threadIDs (conversations) (?)
+
+-   **time_epoch:** Timestamp in Unix epoch time (seconds since 1970-01-01)
+
+-   **condition:** the condition (chatbot) they used - either Metacognitive (A) or Instructional (B)
+
+## Exploring the data!:
+
+**Basic dataset size / stats**
+
+```{r}
+# CHECK if any student had more than one thread!:
+chatlogs %>%
+  distinct(user_id, thread_id) %>%
+  count(user_id, name = "n_threads") %>%
+  summarise(n_users_more_than_one = sum(n_threads > 1))
+# they didn't :)
+```
+
+```{r}
+# per-thread (AI conversation) counts/values
+# OBS if any summary stats need adding per convo, add them to this df:
+per_thread <- chatlogs %>%
+  group_by(thread_id) %>%
+  summarise(
+    n_messages_thread = n(),
+    n_student_messages_thread  = sum(role == "user", na.rm = TRUE),
+    n_ai_messages_thread       = sum(role == "assistant", na.rm = TRUE),
+    condition = first(condition),
+    .groups = "drop"
+  )
+
+
+# overall dataset stats
+stats_overall <- chatlogs %>%
+  summarise(
+    n_messages = n(),
+    n_threads  = n_distinct(thread_id),
+    n_users    = n_distinct(user_id),
+    n_student_messages = sum(role == "user", na.rm = TRUE),
+    n_ai_messages      = sum(role == "assistant", na.rm = TRUE)
+  ) %>%
+  mutate(
+    mean_messages_per_thread = n_messages / n_threads,
+    mean_student_messages_per_thread = mean(per_thread$n_student_messages_thread, na.rm = TRUE),
+    mean_ai_messages_per_thread      = mean(per_thread$n_ai_messages_thread, na.rm = TRUE)
+  )
+
+
+# by condition overall stats to compare:
+stats_by_con <- per_thread %>%
+  group_by(condition)
+
+stats_by_con <- chatlogs %>%
+  group_by(condition) %>%
+  summarise(
+    n_messages = n(),
+    n_threads  = n_distinct(thread_id),
+    n_users    = n_distinct(user_id),
+    n_student_messages = sum(role == "user", na.rm = TRUE),
+    n_ai_messages      = sum(role == "assistant", na.rm = TRUE)
+  ) %>%
+  mutate(
+    mean_messages_per_thread = n_messages / n_threads
+  )
+
+
+# Date range (min/max time_datetime)
+
+
+
+
+
+
+```
+
+A **one-row-per-thread table**: `condition`, `n_turns`, `student_words`, `assistant_words`, `duration`, `student_question_rate`, `assistant_question_rate`
+
+Summaries per thread (= per student conversation?)
+
+```{r}
+
+```
+
+```{r}
+# # (student) messages per thread (boxplot/raincloud plot by condition)
+# Total words per thread (student vs assistant; by condition)
+# ^^ same, but per message
+
+# conversation duration (max–min time_epoch) per thread / mean duration per condition?
+
+
+```
+
+MORE INTERESTING/ADVANCED MESSAGE CONTENT SIGNALS:
+
+STUDENTS - ideas:
+
+-   **Question marks / interrogatives** in student messages (“?”, “how”, “why”) by condition
+
+-   **Imperatives / directive phrasing** in student prompts (e.g., “give me”, “write”, “do”) by condition
+
+-   **Reflection markers** in student text (e.g., “I think”, “I realize”, “I’m confused”, “my goal”) by condition
+
+-   **Metacognitive verbs** frequency (plan/monitor/evaluate: “plan”, “check”, “evaluate”, “reflect”, “understand”) by condition
+
+-   **First-person pronoun rate** (“I”, “my”) by condition (often a proxy for reflection)
+
+```{r}
+
+#
+
+
+
+```
+
+AI COMPARISON(sanity check?) - IDEAS:
+
+-   questions asked by AI (count "?")
+
+-   **Prompting vs telling**: assistant messages that start with questions (“What…/Why…/How…”) vs direct instructions
+
+```{r}
+
+```
+
+Thread structure
+
+```{r}
+#Messages per thread (histogram) + compare A vs B
+
+#Thread duration: (max–min time_epoch within thread) and compare A vs B
+
+
+
+# mean message length per thread/student and per condition?
+
+
+```
+
+INVESTIGATING DELETED MESSAGES!?
+
+```{r}
+
+# % isDeleted == TRUE overall + by role + by condition
+
+# Are deleted messages longer/shorter than non-deleted? (boxplot)
+```
+
+Going deeper...:
+
+```{r}
+# CHECK NUMBER OF THREADS PER STUDENT!
+
+
+# there are 22 user IDs and 22 thread IDs
+
+
+```
+
+## Aggregate variables
+
+CREATE (NEW?) CHATLOG DF WITH RELEVANT AGGREGATE CHATLOG VARIABLES (each row is a student):
+
+```{r}
+# mean characters/words per student message?
+
+
+
+```
+
+## Plots plots plots
+
+Comparing the two AIs:
+
+```{r}
+# mean length of messages
+
+
+
+```
+
+## COMBINE DATASETS?
+
+```{r}
+# combine chatlogs and per_thread ? (add the data from per_thread to df?) so the goal is to have the chatlog data/stats for each student added to their row in df
+
+
+
+```
+
+# 🎶These are a few of my favourite plots🎶
+
+```{r}
+plot_FPQ
 ```
